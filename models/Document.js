@@ -2,6 +2,13 @@ const mongoose = require("mongoose");
 
 const DocumentSchema = new mongoose.Schema(
   {
+    ownerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true,
+    },
+
     originalName: {
       type: String,
       required: true,

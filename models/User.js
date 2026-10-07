@@ -16,9 +16,29 @@ const userSchema = new mongoose.Schema(
       trim: true,
     },
 
+    // Password is required for normal signup,
+    // but not required for Google OAuth users
     password: {
       type: String,
-      required: true,
+      required: false,
+    },
+
+    // Google OAuth user ID
+    googleId: {
+      type: String,
+      unique: true,
+      sparse: true,
+    },
+
+    role: {
+      type: String,
+      enum: ["user", "admin"],
+      default: "user",
+    },
+
+    isActive: {
+      type: Boolean,
+      default: true,
     },
   },
   {
