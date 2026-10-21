@@ -4,7 +4,7 @@ python-multipart>=0.0.9
 pillow>=10.4
 beautifulsoup4>=4.12
 python-dotenv>=1.0
-transformers>=4.46
-accelerate>=1.0
-# Install the CUDA-enabled PyTorch build that matches your NVIDIA driver from pytorch.org.
-torch>=2.4
+# PP-OCRv6 English OCR (CPU backend works without a CUDA setup).
+paddleocr>=3.7,<4
+paddlepaddle>=3.2,<4
+# DeepSeek-OCR dependencies are listed separately in requirements-deepseek.txt.

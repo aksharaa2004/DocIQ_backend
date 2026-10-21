@@ -5,12 +5,16 @@ const bcrypt = require("bcryptjs");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { PDFParse } = require("pdf-parse");
 const mammoth = require("mammoth");
 const JSZip = require("jszip");
 const { createCanvas, loadImage } = require("@napi-rs/canvas");
 const cloudinary = require("cloudinary").v2;
 const { GoogleGenAI } = require("@google/genai");
+const passport = require("passport");
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+
 
 require("dotenv").config({
   path: path.join(__dirname, ".env"),
@@ -41,8 +45,64 @@ const {
   bootstrapAdminAccount,
 } = require("./middleware/auth");
 
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: process.env.GOOGLE_CALLBACK_URL,
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        const email = profile.emails?.[0]?.value?.toLowerCase();
+
+        if (!email) {
+          return done(new Error("Google account email not available"));
+        }
+
+        let user = await User.findOne({
+          $or: [
+            { googleId: profile.id },
+            { email: email },
+          ],
+        });
+
+        if (user) {
+          // Link Google account to an existing account
+          if (!user.googleId) {
+            user.googleId = profile.id;
+            await user.save();
+          }
+
+          return done(null, user);
+        }
+
+        // Create a new DocIQ user for first-time Google login
+        user = new User({
+          name: profile.displayName || "Google User",
+          email: email,
+          googleId: profile.id,
+          role: "user",
+          isActive: true,
+        });
+
+        await user.save();
+
+        return done(null, user);
+      } catch (error) {
+        console.error("Google OAuth error:", error);
+        return done(error, null);
+      }
+    }
+  )
+);
+
 const app = express();
+
 console.log("🔥 THIS SERVER.JS IS RUNNING 🔥");
+
+app.use(passport.initialize());
+
 app.use((req, res, next) => {
   console.log("REQUEST RECEIVED:", req.method, req.url);
   next();
@@ -298,7 +358,32 @@ app.post("/api/assistant/translate", async (req, res) => {
   }
 });
 
-app.post("/api/assistant/chat", async (req, res) => {
+function documentOwnerFilter(req) {
+  return req.user?.role === "admin" ? {} : { ownerId: req.user._id };
+}
+
+function findAccessibleDocument(req, documentId) {
+  return Document.findOne({
+    _id: documentId,
+    ...documentOwnerFilter(req),
+  });
+}
+
+function getFileSha256(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = fs.createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+app.post(
+  "/api/assistant/chat",
+  (req, res, next) =>
+    req.body?.documentId ? authenticateUser(req, res, next) : next(),
+  async (req, res) => {
   const { messages, documentId } = req.body || {};
 
   if (!process.env.GROQ_API_KEY) {
@@ -340,7 +425,7 @@ app.post("/api/assistant/chat", async (req, res) => {
   try {
     let documentContext = "";
     if (documentId) {
-      const document = await Document.findById(documentId).select(
+      const document = await findAccessibleDocument(req, documentId).select(
         "originalName fileType status pages",
       );
       if (!document)
@@ -453,7 +538,8 @@ app.post("/api/assistant/chat", async (req, res) => {
       .status(502)
       .json({ message: "Unable to reach Groq. Please try again." });
   }
-});
+  },
+);
 
 // ======================================================
 // MULTER CONFIGURATION
@@ -520,6 +606,37 @@ function normalizeExtractedText(text) {
     .trim();
 }
 
+function mergePdfOcrText(selectableText, ocrText) {
+  const selectable = normalizeExtractedText(selectableText);
+  const recognized = normalizeExtractedText(ocrText);
+  if (!recognized) return selectable;
+  if (!selectable) return `[Text detected in image]\n${recognized}`;
+
+  const compact = (value) =>
+    value.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const selectableCompact = compact(selectable);
+  const selectableLines = new Set(
+    selectable.split("\n").map((line) => compact(line)).filter(Boolean),
+  );
+  const additionalLines = [];
+  for (const line of recognized.split("\n")) {
+    const value = line.trim();
+    const key = compact(value);
+    if (!key) continue;
+    const alreadyPresent =
+      selectableLines.has(key) ||
+      (key.length >= 4 && selectableCompact.includes(key));
+    if (!alreadyPresent) {
+      additionalLines.push(value);
+      selectableLines.add(key);
+    }
+  }
+
+  return additionalLines.length
+    ? `${selectable}\n\n[Text detected in image]\n${additionalLines.join("\n")}`
+    : selectable;
+}
+
 function cleanPptxText(text) {
   return normalizeExtractedText(
     String(text || "")
@@ -564,6 +681,13 @@ async function ocrImages(images) {
     const ocrUrl = (
       process.env.PYTHON_OCR_URL || "http://127.0.0.1:8000"
     ).replace(/\/$/, "");
+    const configuredTimeout = Number.parseInt(
+      process.env.PYTHON_OCR_TIMEOUT_MS || "120000",
+      10,
+    );
+    const timeoutMs = Number.isFinite(configuredTimeout)
+      ? Math.max(1000, configuredTimeout)
+      : 120000;
     const results = [];
 
     // Keep requests sequential because a single local model instance may share one GPU.
@@ -574,10 +698,23 @@ async function ocrImages(images) {
         new Blob([image.data], { type: image.mimeType || "image/png" }),
         image.label || "image.png",
       );
-      const response = await fetch(`${ocrUrl}/api/ocr/table`, {
-        method: "POST",
-        body: form,
-      });
+      let response;
+      try {
+        response = await fetch(`${ocrUrl}/api/ocr/table`, {
+          method: "POST",
+          body: form,
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+      } catch (error) {
+        if (error.name === "TimeoutError" || error.name === "AbortError") {
+          throw new Error(
+            `Python OCR timed out after ${timeoutMs} ms while reading ${image.label || "an image"}.`,
+          );
+        }
+        throw new Error(
+          `Could not reach the Python OCR service at the configured URL while reading ${image.label || "an image"}. Start the service and check PYTHON_OCR_URL.`,
+        );
+      }
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         const reason = payload.detail || `HTTP ${response.status}`;
@@ -586,7 +723,7 @@ async function ocrImages(images) {
         );
       }
       if (
-        !payload.success ||
+        payload.success !== true ||
         typeof payload.text !== "string" ||
         !payload.text.trim()
       ) {
@@ -683,17 +820,17 @@ async function ocrImages(images) {
   return results;
 }
 
-async function ocrImagesBestEffort(images, documentType) {
+async function ocrImagesBestEffort(images, documentType, batchSize = 3) {
   const results = [];
   const failedBatches = [];
 
-  for (let offset = 0; offset < images.length; offset += 3) {
-    const batch = images.slice(offset, offset + 3);
+  for (let offset = 0; offset < images.length; offset += batchSize) {
+    const batch = images.slice(offset, offset + batchSize);
     try {
       results.push(...(await ocrImages(batch)));
     } catch (error) {
       console.error(
-        `${documentType} image OCR failed; continuing with extracted text:`,
+        `${documentType} image OCR failed${documentType === "PDF" ? ` for ${batch.map((image) => image.label).join(", ")}` : ""}; continuing with extracted text:`,
         error.message,
       );
       results.push(...batch.map(() => ""));
@@ -704,7 +841,9 @@ async function ocrImagesBestEffort(images, documentType) {
   return {
     results,
     warning: failedBatches.length
-      ? "[OCR could not read some embedded images. Editable document text was still extracted; text that exists only inside images may be missing.]"
+      ? documentType === "PDF"
+        ? "[OCR could not read some rendered PDF pages. Text that exists only in those scans may be missing.]"
+        : "[OCR could not read some embedded images. Editable document text was still extracted; text that exists only inside images may be missing.]"
       : "",
   };
 }
@@ -713,8 +852,7 @@ async function readZipImages(filePath, folder) {
   const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
   const imageFiles = Object.values(zip.files)
     .filter((entry) => !entry.dir && entry.name.startsWith(folder))
-    .filter((entry) => /\.(png|jpe?g|webp|gif|bmp)$/i.test(entry.name))
-    .slice(0, 30);
+    .filter((entry) => /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(entry.name));
   return Promise.all(
     imageFiles.map(async (entry) => {
       const extension = path.extname(entry.name).toLowerCase();
@@ -1073,67 +1211,109 @@ async function extractPages(filePath, originalName) {
         pageNumber: page.num,
         text: normalizeExtractedText(page.text),
       }));
-      const imageResult = await parser.getImage({
-        imageThreshold: 140,
-        imageDataUrl: false,
-      });
+      const pagesWithImages = new Set();
+      let imageInspectionFailed = false;
+      try {
+        const imageResult = await parser.getImage({
+          imageThreshold: 140,
+          imageDataUrl: false,
+          imageBuffer: false,
+        });
+        for (const page of imageResult.pages) {
+          if (page.images.length) pagesWithImages.add(page.pageNumber);
+        }
+      } catch (error) {
+        imageInspectionFailed = true;
+        console.error(
+          "PDF embedded-image inspection failed; attempting full-page rendering:",
+          error.message,
+        );
+      }
+
+      const pagesNeedingRendering = pages.filter(
+        (page) =>
+          imageInspectionFailed ||
+          pagesWithImages.has(page.pageNumber) ||
+          page.text.length < 40,
+      );
       const images = [];
       const pageImageRefs = [];
-      for (const page of imageResult.pages) {
-        for (const image of page.images) {
-          if (images.length >= 30) break;
+      const renderFailures = [];
+      console.info(
+        `PDF OCR: rendering ${pagesNeedingRendering.length} of ${pages.length} page(s) as full-page images.`,
+      );
+      for (const page of pagesNeedingRendering) {
+        try {
+          const screenshotResult = await parser.getScreenshot({
+            partial: [page.pageNumber],
+            desiredWidth: 1600,
+            imageDataUrl: false,
+            imageBuffer: true,
+          });
+          const screenshot = screenshotResult.pages.find(
+            (item) => item.pageNumber === page.pageNumber,
+          );
+          const data = Buffer.from(screenshot?.data || []);
+          if (!data.length) {
+            throw new Error("PDF renderer returned an empty page image.");
+          }
           const index = images.length;
           images.push({
             label: `PDF page ${page.pageNumber}`,
             mimeType: "image/png",
-            data: Buffer.from(image.data),
+            data,
           });
           pageImageRefs.push({ pageNumber: page.pageNumber, index });
-        }
-        if (images.length >= 30) break;
-      }
-      const pagesWithImages = new Set(
-        pageImageRefs.map((ref) => ref.pageNumber),
-      );
-      const pagesNeedingRendering = pages
-        .filter(
-          (page) =>
-            page.text.length < 40 && !pagesWithImages.has(page.pageNumber),
-        )
-        .slice(0, Math.max(0, 30 - images.length));
-      if (pagesNeedingRendering.length) {
-        const screenshots = await parser.getScreenshot({
-          partial: pagesNeedingRendering.map((page) => page.pageNumber),
-          desiredWidth: 1600,
-          imageDataUrl: false,
-        });
-        for (const screenshot of screenshots.pages) {
-          if (images.length >= 30) break;
-          const index = images.length;
-          images.push({
-            label: `PDF page ${screenshot.pageNumber}`,
-            mimeType: "image/png",
-            data: Buffer.from(screenshot.data),
-          });
-          pageImageRefs.push({ pageNumber: screenshot.pageNumber, index });
+          console.info(
+            `PDF OCR: rendered page ${page.pageNumber} to PNG (${data.length} bytes).`,
+          );
+        } catch (error) {
+          renderFailures.push(page.pageNumber);
+          console.error(
+            `PDF page ${page.pageNumber} full-page rendering failed:`,
+            error.message,
+          );
         }
       }
+
       const { results: ocr, warning: ocrWarning } = await ocrImagesBestEffort(
         images,
         "PDF",
+        1,
       );
       for (const ref of pageImageRefs) {
         const text = (ocr[ref.index] || "").trim();
-        if (!text || /no readable text/i.test(text)) continue;
+        if (!text || /no readable text/i.test(text)) {
+          console.warn(
+            `PDF page ${ref.pageNumber} OCR returned no readable text.`,
+          );
+          continue;
+        }
         const page = pages.find((item) => item.pageNumber === ref.pageNumber);
-        if (page)
-          page.text = [page.text, `[Text detected in image]\n${text}`]
-            .filter(Boolean)
-            .join("\n\n");
+        if (page) page.text = mergePdfOcrText(page.text, text);
       }
-      if (ocrWarning)
-        pages.push({ pageNumber: pages.length + 1, text: ocrWarning });
-      return pages.filter((page) => page.text);
+      const warnings = [
+        ocrWarning,
+        renderFailures.length
+          ? `[OCR could not render PDF page(s): ${renderFailures.join(", ")}. Text on those pages may be missing.]`
+          : "",
+      ].filter(Boolean);
+      if (warnings.length) {
+        pages.push({
+          pageNumber: pages.length + 1,
+          text: warnings.join("\n"),
+        });
+      }
+      const extractedPages = pages.filter((page) => page.text);
+      const hasReadableContent = extractedPages.some(
+        (page) => !/^\[OCR could not/i.test(page.text),
+      );
+      if (!hasReadableContent) {
+        throw new Error(
+          "No readable text was extracted from this PDF. Check the OCR service and retry.",
+        );
+      }
+      return extractedPages;
     } finally {
       await parser.destroy();
     }
@@ -1149,11 +1329,20 @@ async function extractPages(filePath, originalName) {
     });
 
     const pages = splitIntoPages(result.value);
+    const hasEditableText = Boolean(normalizeExtractedText(result.value));
     const images = await readZipImages(filePath, "word/media/");
     const { results: ocr, warning: ocrWarning } = await ocrImagesBestEffort(
       images,
       "DOCX",
     );
+    const hasImageText = ocr.some(
+      (text) => text.trim() && !/no readable text/i.test(text),
+    );
+    if (!hasEditableText && !hasImageText) {
+      throw new Error(
+        "No readable text was extracted from this DOCX. Check the OCR service if the document contains scanned pages or images.",
+      );
+    }
     if (ocr.some(Boolean)) {
       pages.push({
         pageNumber: pages.length + 1,
@@ -1162,13 +1351,6 @@ async function extractPages(filePath, originalName) {
     }
     if (ocrWarning)
       pages.push({ pageNumber: pages.length + 1, text: ocrWarning });
-    if (!pages.length && !ocr.some(Boolean))
-      return [
-        {
-          pageNumber: 1,
-          text: "No readable text was extracted from this document.",
-        },
-      ];
     return pages;
   }
 
@@ -1234,6 +1416,19 @@ async function extractPages(filePath, originalName) {
         pages[ref.pageIndex].text =
           text ||
           `[No readable text was detected on slide ${ref.pageIndex + 1}.]`;
+      }
+      const hasReadableSlideText = pages
+        .slice(0, slideFiles.length)
+        .some(
+          (page) =>
+            !/^\[No readable text was detected on slide \d+\.\]$/.test(
+              page.text.trim(),
+            ),
+        );
+      if (!hasReadableSlideText) {
+        throw new Error(
+          "No readable text was extracted from this PPTX. Check the OCR service and retry.",
+        );
       }
       if (slideOcrWarning)
         pages.push({ pageNumber: pages.length + 1, text: slideOcrWarning });
@@ -1315,6 +1510,26 @@ async function extractPages(filePath, originalName) {
 function getDocumentProcessingError(error, originalName = "") {
   const details = String(error?.message || "").toLowerCase();
   const extension = path.extname(originalName).toLowerCase();
+
+  if (/timed out|timeout/.test(details)) {
+    return "OCR took too long to process this document. Check that the Python OCR service is running, then retry.";
+  }
+
+  if (/not a valid image|upload a jpeg|uploaded image is empty/.test(details)) {
+    return "This image could not be opened for OCR. Upload a valid PNG, JPG, JPEG, WEBP, TIFF, BMP, or GIF image.";
+  }
+
+  if (/could not reach|econnrefused|failed to fetch|networkerror/.test(details)) {
+    return "DocIQ could not reach the Python OCR service. Start it and check PYTHON_OCR_URL, then retry.";
+  }
+
+  if (/python ocr request failed|ocr model unavailable/.test(details)) {
+    return "The Python OCR service could not process this image. Check its health endpoint and image format, then retry.";
+  }
+
+  if (/returned no extracted text|no readable text was extracted/.test(details)) {
+    return "OCR returned no readable text. Check the scan quality and confirm the document contains text, then retry.";
+  }
 
   if (/ocr_space_api_key|ocr\.space/.test(details)) {
     return "DocIQ could not run OCR.Space on the slides. Check OCR_SPACE_API_KEY and retry.";
@@ -1401,6 +1616,32 @@ app.get("/", (req, res) => {
     message: "DocIQ backend is running successfully!",
   });
 });
+
+app.get(
+  "/api/auth/google",
+  passport.authenticate("google", {
+    scope: ["profile", "email"],
+    session: false,
+  })
+);
+
+app.get(
+  "/api/auth/google/callback",
+  passport.authenticate("google", {
+    session: false,
+    failureRedirect: `${process.env.FRONTEND_URL}/#login?error=google_failed`,
+  }),
+  (req, res) => {
+    const params = new URLSearchParams({
+      token: createAuthToken(req.user),
+      name: req.user.name || "",
+      email: req.user.email || "",
+      role: req.user.role || "user",
+    });
+
+    res.redirect(`${process.env.FRONTEND_URL}/#oauth-callback?${params.toString()}`);
+  }
+);
 
 // ======================================================
 // SIGNUP
@@ -1571,6 +1812,78 @@ app.post("/api/login", async (req, res) => {
 });
 
 // ======================================================
+// CHANGE PASSWORD
+// ======================================================
+
+app.post("/api/change-password", authenticateUser, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+
+    if (
+      typeof currentPassword !== "string" ||
+      !currentPassword ||
+      typeof newPassword !== "string" ||
+      !newPassword
+    ) {
+      return res.status(400).json({
+        message: "Please enter your current and new passwords.",
+      });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        message: "The new password must contain at least 8 characters.",
+      });
+    }
+
+    if (currentPassword === newPassword) {
+      return res.status(400).json({
+        message: "Your new password must be different from your current password.",
+      });
+    }
+
+    const user = await User.findById(req.user._id);
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User account not found.",
+      });
+    }
+
+    if (!user.password) {
+      return res.status(400).json({
+        message: "This account does not have a password yet.",
+      });
+    }
+
+    const isPasswordCorrect = await bcrypt.compare(
+      currentPassword,
+      user.password
+    );
+
+    if (!isPasswordCorrect) {
+      return res.status(401).json({
+        message: "Your current password is incorrect.",
+      });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+
+    return res.status(200).json({
+      message: "Password changed successfully.",
+    });
+  } catch (error) {
+    console.error("Change password error:", error);
+
+    return res.status(500).json({
+      message: "Unable to change your password. Please try again.",
+    });
+  }
+});
+
+
+// ======================================================
 // ADMIN API
 // ======================================================
 
@@ -1610,24 +1923,27 @@ app.get(
       const search = String(req.query.search || "")
         .trim()
         .slice(0, 100);
-      const filter = search
-        ? {
-            $or: [
-              {
-                name: {
-                  $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-                  $options: "i",
-                },
-              },
-              {
-                email: {
-                  $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-                  $options: "i",
-                },
-              },
-            ],
-          }
-        : {};
+      const filter = {
+  role: { $ne: "admin" },
+  ...(search
+    ? {
+        $or: [
+          {
+            name: {
+              $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+              $options: "i",
+            },
+          },
+          {
+            email: {
+              $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+              $options: "i",
+            },
+          },
+        ],
+      }
+    : {}),
+};
       const users = await User.find(filter)
         .select("name email role isActive createdAt")
         .sort({ createdAt: -1 })
@@ -1949,10 +2265,38 @@ app.post(
 
   async (req, res) => {
     let cloudinaryAsset;
+    let contentHash = "";
     try {
       if (!req.file) {
         return res.status(400).json({
           message: "Please select a document to upload.",
+        });
+      }
+
+      contentHash = await getFileSha256(req.file.path);
+      const escapedName = req.file.originalname.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const possibleDuplicate = await Document.findOne({
+        ownerId: req.user._id,
+        $or: [
+          { contentHash },
+          {
+            contentHash: { $in: ["", null] },
+            originalName: new RegExp(`^${escapedName}$`, "i"),
+            fileSize: req.file.size,
+          },
+        ],
+      }).select("_id originalName createdAt");
+
+      if (possibleDuplicate && req.body?.allowDuplicate !== "true") {
+        await fs.promises.unlink(req.file.path).catch(() => {});
+        return res.status(409).json({
+          duplicate: true,
+          existingDocument: {
+            id: possibleDuplicate._id,
+            name: possibleDuplicate.originalName,
+            uploadedAt: possibleDuplicate.createdAt,
+          },
+          message: "This document has already been uploaded.",
         });
       }
 
@@ -1991,6 +2335,8 @@ app.post(
           .toLowerCase(),
 
         fileSize: req.file.size,
+
+        contentHash,
 
         status: "processing",
 
@@ -2093,7 +2439,7 @@ app.post(
 // GET ALL DOCUMENTS
 // ======================================================
 
-app.get("/api/documents", async (req, res) => {
+app.get("/api/documents", authenticateUser, async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) {
       return res.status(503).json({
@@ -2102,7 +2448,7 @@ app.get("/api/documents", async (req, res) => {
       });
     }
 
-    const documents = await Document.find()
+    const documents = await Document.find(documentOwnerFilter(req))
       .sort({
         createdAt: -1,
       })
@@ -2154,25 +2500,18 @@ app.get("/api/documents", async (req, res) => {
 // MARK DOCUMENT AS OPENED
 // ======================================================
 
-app.patch("/api/documents/:id/open", async (req, res) => {
+app.patch("/api/documents/:id/open", authenticateUser, async (req, res) => {
   try {
-    const doc = await Document.findByIdAndUpdate(
-      req.params.id,
-
-      {
-        lastOpenedAt: new Date(),
-      },
-
-      {
-        new: true,
-      },
-    );
+    const doc = await findAccessibleDocument(req, req.params.id);
 
     if (!doc) {
       return res.status(404).json({
         message: "Document not found.",
       });
     }
+
+    doc.lastOpenedAt = new Date();
+    await doc.save();
 
     res.status(200).json({
       message: "Document marked as opened.",
@@ -2192,9 +2531,9 @@ app.patch("/api/documents/:id/open", async (req, res) => {
 // GET SINGLE DOCUMENT
 // ======================================================
 
-app.get("/api/documents/:id", async (req, res) => {
+app.get("/api/documents/:id", authenticateUser, async (req, res) => {
   try {
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
 
     if (!doc) {
       return res.status(404).json({
@@ -2244,13 +2583,58 @@ app.get("/api/documents/:id", async (req, res) => {
   }
 });
 
+app.get("/api/documents/:id/original", authenticateUser, async (req, res) => {
+  try {
+    const doc = await findAccessibleDocument(req, req.params.id);
+
+    if (!doc) {
+      return res.status(404).json({ message: "Document not found." });
+    }
+    if (doc.fileType !== "pdf") {
+      return res.status(415).json({ message: "Original preview is available for PDF files only." });
+    }
+    if (!doc.cloudinaryPublicId || !isCloudinaryConfigured()) {
+      return res.status(404).json({ message: "The original PDF file is unavailable." });
+    }
+
+    const downloadUrl = cloudinary.utils.private_download_url(
+      doc.cloudinaryPublicId,
+      "pdf",
+      {
+        resource_type: doc.cloudinaryResourceType || "raw",
+        type: "upload",
+        expires_at: Math.floor(Date.now() / 1000) + 60,
+      },
+    );
+    const fileResponse = await fetch(downloadUrl);
+
+    if (!fileResponse.ok) {
+      console.error("Cloudinary original PDF fetch failed:", fileResponse.status);
+      return res.status(502).json({ message: "Could not retrieve the original PDF." });
+    }
+
+    const pdfBytes = Buffer.from(await fileResponse.arrayBuffer());
+    res.set({
+      "Content-Type": "application/pdf",
+      "Content-Length": String(pdfBytes.length),
+      "Content-Disposition": "inline",
+      "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    return res.status(200).send(pdfBytes);
+  } catch (error) {
+    console.error("Original PDF fetch error:", error.message);
+    return res.status(502).json({ message: "Could not retrieve the original PDF." });
+  }
+});
+
 // ======================================================
 // DOCUMENT STATUS
 // ======================================================
 
-app.get("/api/documents/:id/status", async (req, res) => {
+app.get("/api/documents/:id/status", authenticateUser, async (req, res) => {
   try {
-    const doc = await Document.findById(req.params.id).select(
+    const doc = await findAccessibleDocument(req, req.params.id).select(
       "status originalName processingError",
     );
 
@@ -2280,7 +2664,7 @@ app.get("/api/documents/:id/status", async (req, res) => {
 // GENERATE WRITTEN EXAM QUESTIONS
 // ======================================================
 
-app.post("/api/ai/short-notes/:id", async (req, res) => {
+app.post("/api/ai/short-notes/:id", authenticateUser, async (req, res) => {
   try {
     if (!process.env.GROQ_API_KEY) {
       return res
@@ -2289,7 +2673,7 @@ app.post("/api/ai/short-notes/:id", async (req, res) => {
           message: "Groq is not configured. Add GROQ_API_KEY to backend/.env.",
         });
     }
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
     if (!doc) return res.status(404).json({ message: "Document not found." });
     if (doc.status !== "ready")
       return res.status(400).json({ message: "Document is not ready yet." });
@@ -2407,7 +2791,7 @@ app.post("/api/ai/short-notes/:id", async (req, res) => {
   }
 });
 
-app.post("/api/ai/flashcards/:id", async (req, res) => {
+app.post("/api/ai/flashcards/:id", authenticateUser, async (req, res) => {
   try {
     if (!process.env.GROQ_API_KEY) {
       return res
@@ -2416,7 +2800,7 @@ app.post("/api/ai/flashcards/:id", async (req, res) => {
           message: "Groq is not configured. Add GROQ_API_KEY to backend/.env.",
         });
     }
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
     if (!doc) return res.status(404).json({ message: "Document not found." });
     if (doc.status !== "ready")
       return res.status(400).json({ message: "Document is not ready yet." });
@@ -2538,9 +2922,9 @@ app.post("/api/ai/flashcards/:id", async (req, res) => {
   }
 });
 
-app.post("/api/ai/exam-questions/:id", async (req, res) => {
+app.post("/api/ai/exam-questions/:id", authenticateUser, async (req, res) => {
   try {
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
 
     if (!doc) {
       return res.status(404).json({
@@ -2680,7 +3064,7 @@ ${documentText}
 // EVALUATE WRITTEN EXAM ANSWER
 // ======================================================
 
-app.post("/api/ai/evaluate-answer/:id", async (req, res) => {
+app.post("/api/ai/evaluate-answer/:id", authenticateUser, async (req, res) => {
   try {
     const { question, answer, marks, answerPoints } = req.body;
 
@@ -2690,7 +3074,7 @@ app.post("/api/ai/evaluate-answer/:id", async (req, res) => {
       });
     }
 
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
 
     if (!doc) {
       return res.status(404).json({
@@ -2868,7 +3252,7 @@ Rules:
 // ADD BOOKMARK
 // ======================================================
 
-app.post("/api/documents/:id/bookmarks", async (req, res) => {
+app.post("/api/documents/:id/bookmarks", authenticateUser, async (req, res) => {
   try {
     const { pageNumber } = req.body;
 
@@ -2878,7 +3262,7 @@ app.post("/api/documents/:id/bookmarks", async (req, res) => {
       });
     }
 
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
 
     if (!doc) {
       return res.status(404).json({
@@ -2918,11 +3302,11 @@ app.post("/api/documents/:id/bookmarks", async (req, res) => {
 // DELETE BOOKMARK
 // ======================================================
 
-app.delete("/api/documents/:id/bookmarks/:pageNumber", async (req, res) => {
+app.delete("/api/documents/:id/bookmarks/:pageNumber", authenticateUser, async (req, res) => {
   try {
     const page = Number(req.params.pageNumber);
 
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
 
     if (!doc) {
       return res.status(404).json({
@@ -2954,7 +3338,7 @@ app.delete("/api/documents/:id/bookmarks/:pageNumber", async (req, res) => {
 // ADD HIGHLIGHT
 // ======================================================
 
-app.post("/api/documents/:id/highlights", async (req, res) => {
+app.post("/api/documents/:id/highlights", authenticateUser, async (req, res) => {
   try {
     const { id, pageNumber, text, start, end } = req.body;
 
@@ -2973,7 +3357,7 @@ app.post("/api/documents/:id/highlights", async (req, res) => {
       });
     }
 
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
 
     if (!doc) {
       return res.status(404).json({
@@ -3104,9 +3488,9 @@ app.post("/api/documents/:id/highlights", async (req, res) => {
 // DELETE HIGHLIGHT
 // ======================================================
 
-app.delete("/api/documents/:id/highlights/:highlightId", async (req, res) => {
+app.delete("/api/documents/:id/highlights/:highlightId", authenticateUser, async (req, res) => {
   try {
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
 
     if (!doc) {
       return res.status(404).json({
@@ -3140,9 +3524,9 @@ app.delete("/api/documents/:id/highlights/:highlightId", async (req, res) => {
 // DELETE DOCUMENT
 // ======================================================
 
-app.delete("/api/documents/:id", async (req, res) => {
+app.delete("/api/documents/:id", authenticateUser, async (req, res) => {
   try {
-    const doc = await Document.findById(req.params.id);
+    const doc = await findAccessibleDocument(req, req.params.id);
 
     if (!doc) {
       return res.status(404).json({
@@ -3173,7 +3557,7 @@ app.delete("/api/documents/:id", async (req, res) => {
     // Delete MongoDB record
     // -----------------------------------------------
 
-    await Document.findByIdAndDelete(req.params.id);
+    await doc.deleteOne();
 
     res.status(200).json({
       message: "Document deleted successfully.",
